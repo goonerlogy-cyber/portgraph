@@ -4,10 +4,13 @@ Live TCP/UDP connections rendered as an animated force-directed graph in
 your terminal, using Unicode braille characters for 2x4 sub-cell resolution
 per terminal cell.
 
-Reads `/proc/net/tcp` and `/proc/net/udp` directly (Linux only), so it only
-needs to run as your own user to see your own process's connections. Seeing
-every connection on the box may need root, depending on kernel hardening.
-IPv4 only for now, IPv6 (`/proc/net/tcp6`, `/proc/net/udp6`) isn't parsed.
+Reads the IPv4 and IPv6 TCP/UDP tables in `/proc/net` directly (Linux only),
+so it only needs to run as your own user to see your own process's
+connections. Seeing every connection on the box may need root, depending
+on kernel hardening. IPv6 sockets from `tcp6` and `udp6` use the same
+process mapping and protocol colors as IPv4 sockets. Kernels without IPv6
+support can omit these tables; errors reading other tables appear in the
+footer while connections from readable tables remain visible.
 
 ## Install
 
