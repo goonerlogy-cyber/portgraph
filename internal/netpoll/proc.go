@@ -2,8 +2,13 @@ package netpoll
 
 import (
 	"bufio"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -28,7 +33,9 @@ type Conn struct {
 }
 
 func (c Conn) Key() string {
-	return fmt.Sprintf("%s:%s:%d-%s:%d", c.Proto, c.LocalIP, c.LocalPort, c.RemoteIP, c.RemotePort)
+	return fmt.Sprintf("%s:%s-%s", c.Proto,
+		net.JoinHostPort(c.LocalIP, strconv.Itoa(int(c.LocalPort))),
+		net.JoinHostPort(c.RemoteIP, strconv.Itoa(int(c.RemotePort))))
 }
 
 var tcpStates = map[string]string{
@@ -46,17 +53,7 @@ var tcpStates = map[string]string{
 }
 
 func Poll() ([]Conn, error) {
-	var conns []Conn
-
-	tcp, err := parseProcNetFile("/proc/net/tcp", TCP)
-	if err == nil {
-		conns = append(conns, tcp...)
-	}
-
-	udp, err := parseProcNetFile("/proc/net/udp", UDP)
-	if err == nil {
-		conns = append(conns, udp...)
-	}
+	conns, err := pollNetFiles("/proc/net")
 
 	inodeToPID := buildInodePIDMap()
 	pidToName := map[int]string{}
@@ -73,7 +70,31 @@ func Poll() ([]Conn, error) {
 		}
 	}
 
-	return conns, nil
+	return conns, err
+}
+
+func pollNetFiles(dir string) ([]Conn, error) {
+	tables := []struct {
+		name     string
+		proto    Proto
+		optional bool
+	}{
+		{"tcp", TCP, false},
+		{"udp", UDP, false},
+		{"tcp6", TCP, true},
+		{"udp6", UDP, true},
+	}
+	var conns []Conn
+	var errs []error
+	for _, table := range tables {
+		entries, err := parseProcNetFile(filepath.Join(dir, table.name), table.proto)
+		conns = append(conns, entries...)
+		// Kernels without IPv6 support may omit both IPv6 tables.
+		if err != nil && !(table.optional && errors.Is(err, os.ErrNotExist)) {
+			errs = append(errs, fmt.Errorf("read %s sockets: %w", table.name, err))
+		}
+	}
+	return conns, errors.Join(errs...)
 }
 
 func parseProcNetFile(path string, proto Proto) ([]Conn, error) {
@@ -139,31 +160,34 @@ func parseProcNetFile(path string, proto Proto) ([]Conn, error) {
 
 func decodeHexAddr(s string) (string, uint16, error) {
 	parts := strings.Split(s, ":")
-	if len(parts) != 2 {
+	if len(parts) != 2 || len(parts[1]) != 4 {
 		return "", 0, fmt.Errorf("bad addr %q", s)
 	}
 
 	ipHex := parts[0]
-	if len(ipHex) != 8 {
-		return "", 0, fmt.Errorf("only ipv4 supported: %q", s)
+	if len(ipHex) != 8 && len(ipHex) != 32 {
+		return "", 0, fmt.Errorf("bad IP address length: %q", s)
 	}
 
-	var b [4]byte
-	for i := range 4 {
-		v, err := strconv.ParseUint(ipHex[i*2:i*2+2], 16, 8)
+	// Linux prints addresses as native-endian 32-bit words: one for IPv4,
+	// four for IPv6. Reverse bytes within each word on little-endian hosts,
+	// not the entire IPv6 address.
+	var raw [16]byte
+	for i := 0; i < len(ipHex); i += 8 {
+		v, err := strconv.ParseUint(ipHex[i:i+8], 16, 32)
 		if err != nil {
 			return "", 0, err
 		}
-		b[i] = byte(v)
+		binary.NativeEndian.PutUint32(raw[i/2:i/2+4], uint32(v))
 	}
-	ip := fmt.Sprintf("%d.%d.%d.%d", b[3], b[2], b[1], b[0])
+	ip, _ := netip.AddrFromSlice(raw[:len(ipHex)/2])
 
 	port, err := strconv.ParseUint(parts[1], 16, 16)
 	if err != nil {
 		return "", 0, err
 	}
 
-	return ip, uint16(port), nil
+	return ip.String(), uint16(port), nil
 }
 
 func buildInodePIDMap() map[uint64]int {
